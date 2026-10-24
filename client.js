@@ -310,12 +310,13 @@ window.__ModuleLoader__.load({
         } catch {
           source = null;
         }
+        // Always reconcile with the host on a timer. SSE gives instant updates,
+        // but a silently dead stream must not freeze the whole panel.
         poll = setInterval(() => {
-          if (source && source.readyState === 1) return;
           api('/state')
             .then((snapshot) => alive.current && apply(snapshot))
             .catch(() => {});
-        }, 4000);
+        }, 5000);
         return () => {
           alive.current = false;
           if (source) source.close();
@@ -329,6 +330,20 @@ window.__ModuleLoader__.load({
         if (!state) return;
         if (state.login?.configured || state.loginFlow?.status === 'expired') setLocalQr(null);
       }, [state?.sentAt]);
+
+      // While a QR is pending, poll the login state every 2s as a fallback. A
+      // stale SSE stream must not leave "waiting" on screen after the phone
+      // has already confirmed.
+      useEffect(() => {
+        const status = state?.loginFlow?.status;
+        if (status !== 'waiting' && status !== 'scanned') return undefined;
+        const timer = setInterval(() => {
+          api('/state')
+            .then((snapshot) => apply(snapshot))
+            .catch(() => {});
+        }, 2000);
+        return () => clearInterval(timer);
+      }, [state?.loginFlow?.status]);
 
       // Keep the field in step with the saved room, but never while the user is
       // editing it.
@@ -566,8 +581,8 @@ window.__ModuleLoader__.load({
                 disabled: busy || !roomInput,
                 onClick: connectRoom,
               }, status.connected || status.connecting ? '重新连接' : '连接直播间'),
-              status.connected || status.connecting
-                ? h(Btn, { disabled: disconnecting, onClick: disconnectRoom }, disconnecting ? '断开中…' : '断开')
+              settings.roomId
+                ? h(Btn, { disabled: disconnecting, onClick: disconnectRoom }, disconnecting ? '断开中…' : '断开直播间')
                 : null,
               roomInfo
                 ? h('span', { style: { fontSize: 12, color: T.muted } }, `${roomInfo.area || ''} · ${online ? '直播中' : '未开播'} · 房间 ${roomInfo.roomId} · 人气 ${Number(status.popularity || 0).toLocaleString()}`)

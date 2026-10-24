@@ -72,6 +72,24 @@ function safeText(value, max) {
   return String(value ?? '').slice(0, max);
 }
 
+/**
+ * Treat the loopback spellings as one origin. A page opened as
+ * `localhost:PORT` must be able to drive a server bound to `127.0.0.1:PORT`.
+ */
+function sameOrigin(origin, allowed) {
+  if (!origin || !allowed) return true;
+  try {
+    const left = new URL(origin);
+    const right = new URL(allowed);
+    if (left.protocol !== right.protocol || left.port !== right.port) return false;
+    if (left.hostname === right.hostname) return true;
+    const loopback = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
+    return loopback.has(left.hostname) && loopback.has(right.hostname);
+  } catch {
+    return false;
+  }
+}
+
 function sanitizeReply(raw) {
   let text = String(raw ?? '').replace(/\s+/g, ' ').trim();
   text = text.replace(/^["'“”‘’「」『』《》]+/, '').replace(/["'“”‘’「」『』《》]+$/, '');
@@ -638,7 +656,7 @@ export function apply(ctx) {
       allowedOrigin = null;
     }
     const origin = req.headers.origin;
-    if (origin && allowedOrigin && origin !== allowedOrigin) {
+    if (origin && allowedOrigin && !sameOrigin(origin, allowedOrigin)) {
       send(res, 403, { error: 'origin not allowed' });
       return;
     }
