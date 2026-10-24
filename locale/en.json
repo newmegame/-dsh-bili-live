@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Bilibili Live Assistant",
+    "description": "Watches a Bilibili live room's danmaku, answers with keyword rules or an AI model, and (after QR sign-in) sends replies from your own account."
+  }
+}

@@ -1,0 +1,3 @@
+- insert:
+    - id: bili-live-assistant
+      name: '@local/dsh-bili-live'

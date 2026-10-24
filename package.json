@@ -1,0 +1,45 @@
+{
+  "name": "@local/dsh-bili-live",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Bilibili live assistant: danmaku monitoring and automatic replies from a DSH panel.",
+  "license": "MIT",
+  "author": "dsh-bili-live contributors",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "bilibili",
+    "live",
+    "danmaku",
+    "chatbot",
+    "auto-reply"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "lib/*.js",
+    "vendor/*.cjs",
+    "cordis.patch.yml",
+    "README.md",
+    "安装说明.md",
+    "PUBLISH.md",
+    "LICENSE",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": ["@deepseek-ai/dsh-client-ui-conversation"]
+    }
+  }
+}
