@@ -9,6 +9,7 @@ import { createRequire } from 'node:module';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { BiliApiError, BiliLive } from './lib/bili.js';
+import { findClient, playSong, searchSongs } from './lib/song.js';
 
 const require = createRequire(import.meta.url);
 
@@ -32,6 +33,9 @@ const DEFAULT_RULES = [
 const DEFAULT_SYSTEM_PROMPT =
   '你在替主播回复直播间弹幕。只输出一句不超过 20 个字的简体中文回复，语气自然、口语化，' +
   '像主播本人在聊天；不要使用引号、换行、颜文字或表情代码，不要提到自己是 AI 或机器人。';
+
+/** Danmaku prefixes that turn the rest of the line into a song name. */
+const DEFAULT_SONG_KEYWORDS = ['点歌', '点一首', '来一首', '来首', '放一首', '放首', '播放', '想听'];
 
 const BUILTIN_STYLES = [
   { id: 'natural', name: '自然', builtin: true, prompt: '语气自然、口语化，像主播平时和观众聊天，不端着。' },
@@ -58,6 +62,13 @@ function defaults() {
     rules: DEFAULT_RULES.map((rule) => ({ ...rule })),
     bannedWords: [],
     style: { activeId: 'natural', custom: [] },
+    songRequest: {
+      enabled: true,
+      replyEnabled: true,
+      keywords: DEFAULT_SONG_KEYWORDS.slice(),
+      cooldownMs: 15000,
+      perUserCooldownMs: 120000,
+    },
     auth: null,
   };
 }
@@ -142,6 +153,77 @@ function normalizeStyle(next, fallback) {
   return { activeId, custom };
 }
 
+/**
+ * Song-request settings. Keywords are the danmaku prefixes that carry a track
+ * name; an empty list is replaced by the built-in set so the feature can never
+ * be left half-configured.
+ */
+function normalizeSongRequest(next, fallback) {
+  const source = next && typeof next === 'object' ? next : {};
+  const previous = fallback && typeof fallback === 'object' ? fallback : {};
+  const rawKeywords = Array.isArray(source.keywords)
+    ? source.keywords
+    : Array.isArray(previous.keywords)
+      ? previous.keywords
+      : DEFAULT_SONG_KEYWORDS;
+  const keywords = [];
+  const seen = new Set();
+  for (const word of rawKeywords.slice(0, 30)) {
+    const clean = safeText(word, 20).trim();
+    if (!clean || seen.has(clean.toLowerCase())) continue;
+    seen.add(clean.toLowerCase());
+    keywords.push(clean);
+  }
+  return {
+    enabled: source.enabled === undefined ? previous.enabled !== false : Boolean(source.enabled),
+    replyEnabled: source.replyEnabled === undefined ? previous.replyEnabled !== false : Boolean(source.replyEnabled),
+    keywords: keywords.length > 0 ? keywords : DEFAULT_SONG_KEYWORDS.slice(),
+    cooldownMs: clampNumber(source.cooldownMs ?? previous.cooldownMs, 2000, 600000, 15000),
+    perUserCooldownMs: clampNumber(
+      source.perUserCooldownMs ?? previous.perUserCooldownMs,
+      5000,
+      3600000,
+      120000,
+    ),
+  };
+}
+
+/**
+ * Pull a track name out of a danmaku line. The name is whatever follows the
+ * first matched keyword; when a viewer writes the name first ("半点心 点歌")
+ * the text before the keyword is used instead. Returns null when the line
+ * carries no usable name.
+ */
+export function parseSongQuery(text, keywords) {
+  const source = String(text || '').trim();
+  if (!source) return null;
+  const lower = source.toLowerCase();
+  let hit = null;
+  for (const word of keywords || []) {
+    const keyword = String(word || '').trim();
+    if (!keyword) continue;
+    const at = lower.indexOf(keyword.toLowerCase());
+    if (at < 0) continue;
+    if (!hit || at < hit.at) hit = { at, length: keyword.length };
+  }
+  if (!hit) return null;
+  const clean = (value) => {
+    const raw = safeText(value, 60).trim();
+    // 《稻香》 / 「晴天」 keeps only the quoted part, so a trailing 吧 or 呀
+    // outside the brackets never reaches the search.
+    const quoted = raw.match(/[《「『“"]([^》」』”"]{1,60})[》」』”"]/);
+    const text = quoted ? quoted[1] : raw;
+    return text
+      .replace(/^[\s:：,，、.。!！?？~～《》「」『』"'“”‘’\-—]+/, '')
+      .replace(/[\s~～]+$/, '')
+      .trim();
+  };
+  const tail = clean(source.slice(hit.at + hit.length));
+  if (tail) return tail;
+  const head = clean(source.slice(0, hit.at));
+  return head || null;
+}
+
 export const inject = ['webServer', 'tools'];
 
 export function apply(ctx) {
@@ -163,6 +245,13 @@ export function apply(ctx) {
   const listeners = new Set();
   const logs = [];
   const stats = { received: 0, generated: 0, sent: 0, dry: 0, failed: 0, skipped: 0, blocked: 0 };
+  const songs = [];
+  const songState = { lastAt: 0, perUser: new Map(), client: null };
+  try {
+    songState.client = findClient();
+  } catch {
+    songState.client = null;
+  }
   let lastSentAt = 0;
   let pendingEcho = null;
   let queue = [];
@@ -213,6 +302,7 @@ export function apply(ctx) {
       settings.rules = Array.isArray(settings.rules) && settings.rules.length > 0 ? settings.rules : defaults().rules;
       settings.systemPrompt = settings.systemPrompt || DEFAULT_SYSTEM_PROMPT;
       settings.style = normalizeStyle(settings.style, defaults().style);
+      settings.songRequest = normalizeSongRequest(settings.songRequest, defaults().songRequest);
       if (settings.auth && !settings.auth.sessdata) settings.auth = null;
     } catch (error) {
       if (error && error.code !== 'ENOENT') pushLog(`读取本地配置失败：${error.message}`, 'warn');
@@ -283,8 +373,14 @@ export function apply(ctx) {
         rules: settings.rules,
         bannedWords: settings.bannedWords,
         style: settings.style,
+        songRequest: settings.songRequest,
       },
       stylePresets: BUILTIN_STYLES,
+      songs: songs.slice(-20),
+      songEngine: {
+        mode: songState.client ? 'client' : 'web',
+        clientPath: songState.client || '',
+      },
       login: auth?.sessdata
         ? {
             configured: true,
@@ -331,6 +427,19 @@ export function apply(ctx) {
       return;
     }
     scheduleBroadcast();
+    if (settings.songRequest?.enabled) {
+      const query = parseSongQuery(entry.text, settings.songRequest.keywords);
+      if (query) {
+        // A handled song request replaces the chat reply: answering "记下啦"
+        // while the assistant is already starting the track reads as noise.
+        // A cooled-down request falls through to the normal reply path so the
+        // viewer still gets an answer.
+        if (!songLimitReason(entry)) {
+          void handleSongRequest(entry, query);
+          return;
+        }
+      }
+    }
     if (settings.enabled && settings.autoReply) {
       if (queue.length > 30) queue.shift();
       queue.push(entry);
@@ -444,6 +553,116 @@ export function apply(ctx) {
       pushLog(`回复失败：${reply.error}`, 'error');
     }
     scheduleBroadcast();
+  }
+
+  /**
+   * Search with the raw name, then once more with trailing mood particles
+   * stripped ("孤勇者吧" → "孤勇者"), because viewers type conversationally.
+   */
+  async function resolveSong(query) {
+    const attempts = [query];
+    const stripped = String(query).replace(/[吧呀啦哦嘛哟啊]+$/, '').trim();
+    if (stripped && stripped !== query) attempts.push(stripped);
+    for (const attempt of attempts) {
+      const found = await searchSongs(attempt, 5);
+      if (found.length > 0) return found[0];
+    }
+    return null;
+  }
+
+  /** Returns a skip reason and consumes the rate window, or null when allowed. */
+  function songLimitReason(entry) {
+    const cfg = settings.songRequest;
+    const now = Date.now();
+    // Our own announcement echoes back through the danmaku stream; treating it
+    // as a request would replay the song for ever.
+    if (settings.auth?.uid && entry.uid === Number(settings.auth.uid)) return '自己的弹幕';
+    if (now - songState.lastAt < cfg.cooldownMs) return '点歌全局冷却中';
+    const userAt = songState.perUser.get(entry.uid) || 0;
+    if (now - userAt < cfg.perUserCooldownMs) return '该用户刚点过歌';
+    songState.lastAt = now;
+    songState.perUser.set(entry.uid, now);
+    if (songState.perUser.size > 500) songState.perUser.clear();
+    return null;
+  }
+
+  /**
+   * Search the requested track on Netease CloudMusic and start it locally. The
+   * danmaku reply is best effort: a failed announcement must not hide a track
+   * that did start.
+   */
+  async function handleSongRequest(entry, query) {
+    const record = {
+      id: entry.id,
+      user: entry.user,
+      text: entry.text,
+      query,
+      song: null,
+      status: 'searching',
+      mode: null,
+      error: null,
+      at: Date.now(),
+    };
+    songs.push(record);
+    if (songs.length > 40) songs.shift();
+    scheduleBroadcast();
+    try {
+      const song = await resolveSong(query);
+      if (!song) {
+        record.status = 'notfound';
+        record.error = `网易云没有搜到「${query}」`;
+        pushLog(`点歌失败 ${entry.user}：${record.error}`, 'warn');
+        scheduleBroadcast();
+        return;
+      }
+      const played = await playSong(song);
+      record.song = {
+        id: song.id,
+        name: song.name,
+        artists: song.artists,
+        album: song.album,
+        duration: song.duration,
+      };
+      record.mode = played.mode;
+      record.status = 'playing';
+      pushLog(
+        `点歌 ${entry.user}：《${song.name}》${song.artists.length ? ` - ${song.artists.join('/')}` : ''}` +
+          `（${played.mode === 'client' ? '网易云客户端' : '网页播放器'}）`,
+      );
+      scheduleBroadcast();
+      if (settings.songRequest.replyEnabled) {
+        await speakAsAssistant(`《${song.name}》开播啦`);
+      }
+    } catch (error) {
+      record.status = 'failed';
+      record.error = safeText(error?.message || error, 200);
+      pushLog(`点歌失败 ${entry.user}：${record.error}`, 'warn');
+      scheduleBroadcast();
+    }
+  }
+
+  /** Send one line to the room under the same guards as the reply engine. */
+  async function speakAsAssistant(raw) {
+    const text = sanitizeReply(raw);
+    if (!text) return;
+    const bannedHit = findBanned(text, settings.bannedWords);
+    if (bannedHit) {
+      pushLog(`点歌回复被违禁词拦截：${text}`, 'warn');
+      return;
+    }
+    if (settings.dryRun) {
+      pushLog(`预演点歌回复：${text}`);
+      return;
+    }
+    if (!settings.auth?.sessdata || !status.connected || !bili.roomId) return;
+    try {
+      await bili.sendDanmaku(settings.auth, bili.roomId, text);
+      lastSentAt = Date.now();
+      minuteWindow.push(lastSentAt);
+      pendingEcho = { text, at: lastSentAt };
+    } catch (error) {
+      pushLog(`点歌回复发送失败：${safeText(error.message, 200)}`, 'error');
+    }
   }
 
   async function resolveLlm() {
@@ -715,6 +934,9 @@ export function apply(ctx) {
           }
         }
         if (next.style !== undefined) settings.style = normalizeStyle(next.style, settings.style);
+        if (next.songRequest !== undefined) {
+          settings.songRequest = normalizeSongRequest(next.songRequest, settings.songRequest);
+        }
         if (Array.isArray(next.rules)) {
           settings.rules = next.rules.slice(0, 50).map((rule) => ({
             keyword: safeText(rule?.keyword, 40),
@@ -821,6 +1043,61 @@ export function apply(ctx) {
         pushLog('已退出 B 站登录');
         broadcast();
         send(res, 200, snapshot());
+        return;
+      }
+
+      if (method === 'POST' && path === '/bili-live/song/play') {
+        const body = await readBody(req);
+        const query = safeText(body.query, 60).trim();
+        if (!query) {
+          send(res, 400, { error: '请先填写歌名' });
+          return;
+        }
+        const record = {
+          id: makeId(),
+          user: '面板点歌',
+          text: query,
+          query,
+          song: null,
+          status: 'searching',
+          mode: null,
+          error: null,
+          at: Date.now(),
+        };
+        songs.push(record);
+        if (songs.length > 40) songs.shift();
+        scheduleBroadcast();
+        try {
+          const song = await resolveSong(query);
+          if (!song) {
+            record.status = 'notfound';
+            record.error = `网易云没有搜到「${query}」`;
+            scheduleBroadcast();
+            send(res, 404, { error: record.error });
+            return;
+          }
+          const played = await playSong(song);
+          record.song = {
+            id: song.id,
+            name: song.name,
+            artists: song.artists,
+            album: song.album,
+            duration: song.duration,
+          };
+          record.mode = played.mode;
+          record.status = 'playing';
+          pushLog(
+            `面板点歌：《${song.name}》${song.artists.length ? ` - ${song.artists.join('/')}` : ''}` +
+              `（${played.mode === 'client' ? '网易云客户端' : '网页播放器'}）`,
+          );
+          scheduleBroadcast();
+          send(res, 200, snapshot());
+        } catch (error) {
+          record.status = 'failed';
+          record.error = safeText(error?.message || error, 200);
+          scheduleBroadcast();
+          send(res, 400, { error: record.error });
+        }
         return;
       }
 

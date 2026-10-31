@@ -266,6 +266,8 @@ window.__ModuleLoader__.load({
       const [cookieSess, setCookieSess] = useState('');
       const [cookieJct, setCookieJct] = useState('');
       const [cookieUid, setCookieUid] = useState('');
+      const [songInput, setSongInput] = useState('');
+      const [songBusy, setSongBusy] = useState(false);
       const alive = useRef(true);
       const lastSentAt = useRef(0);
       const roomFocused = useRef(false);
@@ -470,6 +472,23 @@ window.__ModuleLoader__.load({
 
       const patch = (settings, successText) => run(() => api('/settings', { settings }), successText);
 
+      const playSongNow = async () => {
+        const query = songInput.trim();
+        if (!query) return;
+        setSongBusy(true);
+        setError('');
+        try {
+          const snapshot = await api('/song/play', { query });
+          apply(snapshot);
+          setNotice(`已点播：${query}`);
+          setSongInput('');
+        } catch (err) {
+          setError(err.message);
+        } finally {
+          setSongBusy(false);
+        }
+      };
+
       if (!state) {
         return h(
           'div',
@@ -478,7 +497,7 @@ window.__ModuleLoader__.load({
         );
       }
 
-      const { status, settings, login, loginFlow, llm, stats, recent, replies = [], logs, storagePath, stylePresets = [] } = state;
+      const { status, settings, login, loginFlow, llm, stats, recent, replies = [], logs, storagePath, stylePresets = [], songs = [], songEngine = {} } = state;
       const roomInfo = status.roomInfo;
       const online = roomInfo?.liveStatus === 1;
       const showQr = loginFlow.status === 'waiting' || loginFlow.status === 'scanned' || Boolean(localQr);
@@ -495,6 +514,13 @@ window.__ModuleLoader__.load({
       const setRules = (rules) => patch({ rules });
 
       const style = settings.style || { activeId: 'natural', custom: [] };
+      const songRequest = settings.songRequest || {
+        enabled: false,
+        replyEnabled: true,
+        keywords: [],
+        cooldownMs: 15000,
+        perUserCooldownMs: 120000,
+      };
       const allStyles = [...stylePresets, ...(style.custom || [])];
       const currentStyle = allStyles.find((item) => item.id === style.activeId) || allStyles[0] || { name: '自然', prompt: '' };
 
@@ -818,6 +844,133 @@ window.__ModuleLoader__.load({
                   style: { width: '100%', marginTop: 8, resize: 'vertical', lineHeight: 1.6 },
                 })
               : null,
+          ),
+
+          // song requests
+          h(
+            Card,
+            {
+              title: '点歌',
+              description: songRequest.enabled
+                ? `弹幕命中关键词就搜网易云并${songEngine.mode === 'client' ? '用客户端播放' : '用网页播放'}`
+                : '已关闭，不会响应点歌弹幕',
+            },
+            h(
+              'div',
+              { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(230px, 1fr))', gap: 12, marginBottom: 12 } },
+              h(Switch, {
+                checked: songRequest.enabled,
+                label: '点歌开关',
+                hint: songEngine.mode === 'client' ? '已检测到网易云客户端' : '没检测到客户端，会用网页播放',
+                onChange: (value) => patch({ songRequest: { ...songRequest, enabled: value } }),
+              }),
+              h(Switch, {
+                checked: songRequest.replyEnabled,
+                label: '播报弹幕',
+                hint: '点播成功后回一条弹幕',
+                onChange: (value) => patch({ songRequest: { ...songRequest, replyEnabled: value } }),
+              }),
+            ),
+            h(
+              'div',
+              { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 10, marginBottom: 12 } },
+              h(
+                'label',
+                { style: { display: 'flex', flexDirection: 'column', gap: 4, fontSize: 12, color: T.muted } },
+                '点歌冷却（秒）',
+                h(Editable, {
+                  value: String(Math.round(songRequest.cooldownMs / 1000)),
+                  onCommit: (value) => patch({ songRequest: { ...songRequest, cooldownMs: Number(value) * 1000 } }),
+                  style: { width: '100%' },
+                }),
+              ),
+              h(
+                'label',
+                { style: { display: 'flex', flexDirection: 'column', gap: 4, fontSize: 12, color: T.muted } },
+                '同一用户冷却（秒）',
+                h(Editable, {
+                  value: String(Math.round(songRequest.perUserCooldownMs / 1000)),
+                  onCommit: (value) => patch({ songRequest: { ...songRequest, perUserCooldownMs: Number(value) * 1000 } }),
+                  style: { width: '100%' },
+                }),
+              ),
+            ),
+            h(
+              'div',
+              { style: { fontSize: 12, color: T.muted, marginBottom: 6 } },
+              '触发关键词（逗号分隔，命中后后面的文字当歌名；「半点心 点歌」这种顺序也认）',
+            ),
+            h(Editable, {
+              value: (songRequest.keywords || []).join('，'),
+              onCommit: (value) =>
+                patch({
+                  songRequest: {
+                    ...songRequest,
+                    keywords: value.split(/[，,、\\s]+/).map((item) => item.trim()).filter(Boolean),
+                  },
+                }),
+              style: { width: '100%', marginBottom: 12 },
+            }),
+            h('div', { style: { fontSize: 12, color: T.muted, marginBottom: 6 } }, '手动点歌（立即播放，也可以拿来回答观众）'),
+            h(
+              'div',
+              { style: { display: 'flex', gap: 8, marginBottom: 12, flexWrap: 'wrap' } },
+              h('input', {
+                value: songInput,
+                onChange: (event) => setSongInput(event.target.value),
+                onKeyDown: (event) => {
+                  if (event.key === 'Enter') playSongNow();
+                },
+                placeholder: '歌名，例如 半点心',
+                style: { ...inputStyle, flex: '1 1 220px' },
+              }),
+              h(Btn, { kind: 'primary', disabled: songBusy || !songInput.trim(), onClick: playSongNow }, songBusy ? '点播中…' : '点播'),
+            ),
+            songs.length > 0
+              ? h(
+                  'div',
+                  { style: { display: 'flex', flexDirection: 'column', gap: 4 } },
+                  songs
+                    .slice()
+                    .reverse()
+                    .slice(0, 6)
+                    .map((item) =>
+                      h(
+                        'div',
+                        { key: item.id, style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, minWidth: 0 } },
+                        h(
+                          'span',
+                          {
+                            style: {
+                              flex: '0 0 auto',
+                              color:
+                                item.status === 'playing'
+                                  ? T.success
+                                  : item.status === 'failed' || item.status === 'notfound'
+                                    ? T.error
+                                    : T.muted,
+                            },
+                          },
+                          item.status === 'playing'
+                            ? '播放中'
+                            : item.status === 'notfound'
+                              ? '没找到'
+                              : item.status === 'failed'
+                                ? '失败'
+                                : '搜索中',
+                        ),
+                        h(
+                          'span',
+                          { style: { color: T.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
+                          item.song
+                            ? `${item.song.name}${item.song.artists?.length ? ` - ${item.song.artists.join('/')}` : ''}`
+                            : `「${item.query}」`,
+                        ),
+                        h('span', { style: { color: T.muted, marginLeft: 'auto', flex: '0 0 auto' } }, item.user),
+                      ),
+                    ),
+                )
+              : h('div', { style: { fontSize: 12, color: T.muted } }, '还没有人点歌。观众发「点歌 半点心」就会自动播放。'),
           ),
 
           // reply style
